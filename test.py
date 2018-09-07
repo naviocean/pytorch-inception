@@ -92,8 +92,9 @@ class Testing(object):
         normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
         val_transformations = Compose([
-            Scale(256),
+            Resize(256),
             CenterCrop(224),
+            RandomHorizontalFlip(),
             ToTensor(),
             normalize
         ])
@@ -108,7 +109,7 @@ class Testing(object):
 
         test_loader = data.DataLoader(
             test_dataset,
-            batch_size=self.batch_size,
+            batch_size=1,
             shuffle=False,
             num_workers=self.workers,
             pin_memory=False)

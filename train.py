@@ -161,9 +161,9 @@ class Training(object):
         val_loader = data.DataLoader(
             val_dataset,
             batch_size=self.batch_size,
-            shuffle=False,
+            shuffle=True,
             num_workers=self.workers,
-            pin_memory=False)
+            pin_memory=True)
 
         return (train_loader, val_loader)
 
