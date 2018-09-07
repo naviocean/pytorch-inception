@@ -1,0 +1,337 @@
+from __future__ import print_function
+import os
+import os.path
+import shutil
+import time
+import torch.backends.cudnn as cudnn
+import torch.nn as nn
+import torch.nn.parallel
+import torch.optim as optim
+import torch.utils.data as data
+from meter import AverageMeter
+from logger import Logger
+from dataset import MyDataset
+from models.inceptionv4 import inceptionv4
+from utils import check_gpu, accuracy
+from visualize import Visualizer
+from torchvision.transforms import *
+
+
+class Training(object):
+    def __init__(self, name_list, num_classes=400, **kwargs):
+        self.__dict__.update(kwargs)
+        self.num_classes = num_classes
+        self.name_list = name_list
+        # set accuracy avg = 0
+        self.count_early_stop = 0
+        # Set best precision = 0
+        self.best_prec1 = 0
+        # init start epoch = 0
+        self.start_epoch = 0
+
+        if self.log_visualize != '':
+            self.visualizer = Visualizer(logdir=self.log_visualize)
+
+        self.checkDataFolder()
+
+        self.loading_model()
+
+        self.train_loader, self.val_loader = self.loading_data()
+
+        # run
+        self.processing()
+
+    def check_early_stop(self, accuracy, logger, start_time):
+        if self.best_prec1 <= accuracy:
+            self.count_early_stop = 0
+        else:
+            self.count_early_stop += 1
+
+        if self.count_early_stop > self.early_stop:
+            print('Early stop')
+            end_time = time.time()
+            print("--- Total training time %s seconds ---" %
+                  (end_time - start_time))
+            logger.info("--- Total training time %s seconds ---" %
+                        (end_time - start_time))
+            exit()
+
+    def checkDataFolder(self):
+        try:
+            os.stat('./' + self.model_type + '_' + self.data_set)
+        except:
+            os.mkdir('./' + self.model_type + '_' + self.data_set)
+        self.data_folder = './' + self.model_type + '_' + self.data_set
+
+    # Loading P3D model
+    def loading_model(self):
+
+        print('Loading %s model' % (self.model_type))
+
+        if self.model_type == 'inceptionv4':
+            self.model = inceptionv4(num_classes=self.num_classes, pretrained=None)
+        else:
+            print('no model')
+            exit()
+
+        # Check gpu and run parallel
+        if check_gpu() > 0:
+            self.model = torch.nn.DataParallel(self.model).cuda()
+
+        # define loss function (criterion) and optimizer
+        self.criterion = nn.CrossEntropyLoss()
+        if check_gpu() > 0:
+            self.criterion = nn.CrossEntropyLoss().cuda()
+
+        policies = self.model.parameters()
+
+        self.optimizer = optim.SGD(policies, lr=self.lr, momentum=self.momentum, weight_decay=self.weight_decay)
+
+        # optionally resume from a checkpoint
+        if self.resume:
+            if os.path.isfile(self.resume):
+                print("=> loading checkpoint '{}'".format(self.resume))
+                checkpoint = torch.load(self.resume)
+                self.start_epoch = checkpoint['epoch']
+                self.best_prec1 = checkpoint['best_prec1']
+                self.model.load_state_dict(checkpoint['state_dict'])
+                self.optimizer.load_state_dict(checkpoint['optimizer'])
+                print("=> loaded checkpoint '{}' (epoch {})".format(
+                    self.evaluate, checkpoint['epoch']))
+            else:
+                print("=> no checkpoint found at '{}'".format(self.resume))
+
+        if self.evaluate:
+            file_model_best = os.path.join(
+                self.data_folder, 'model_best.pth.tar')
+            if os.path.isfile(file_model_best):
+                print("=> loading checkpoint '{}'".format('model_best.pth.tar'))
+                checkpoint = torch.load(file_model_best)
+                self.start_epoch = checkpoint['epoch']
+                self.best_prec1 = checkpoint['best_prec1']
+                self.model.load_state_dict(checkpoint['state_dict'])
+                self.optimizer.load_state_dict(checkpoint['optimizer'])
+                print("=> loaded checkpoint '{}' (epoch {})".format(
+                    self.evaluate, checkpoint['epoch']))
+            else:
+                print("=> no checkpoint found at '{}'".format(self.resume))
+
+        cudnn.benchmark = True
+
+    # Loading data
+    def loading_data(self):
+
+        normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        train_transformations = Compose([
+            RandomResizedCrop(224),
+            RandomHorizontalFlip(),
+            ToTensor(),
+            normalize])
+
+        val_transformations = Compose([
+            Resize(256),
+            CenterCrop(224),
+            ToTensor(),
+            normalize
+        ])
+
+        train_dataset = MyDataset(
+            self.data,
+            data_folder="train",
+            name_list=self.name_list,
+            version="1",
+            transform=train_transformations,
+        )
+
+        val_dataset = MyDataset(
+            self.data,
+            data_folder="validation",
+            name_list=self.name_list,
+            version="1",
+            transform=val_transformations,
+        )
+
+        train_loader = data.DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.workers,
+            pin_memory=True)
+
+        val_loader = data.DataLoader(
+            val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.workers,
+            pin_memory=False)
+
+        return (train_loader, val_loader)
+
+    def processing(self):
+        log_file = os.path.join(self.data_folder, 'train.log')
+
+        logger = Logger('train', log_file)
+
+        if self.evaluate:
+            self.validate(logger)
+            return
+
+        iter_per_epoch = len(self.train_loader)
+        logger.info('Iterations per epoch: {0}'.format(iter_per_epoch))
+        print('Iterations per epoch: {0}'.format(iter_per_epoch))
+
+        start_time = time.time()
+
+        for epoch in range(self.start_epoch, self.epochs):
+            self.adjust_learning_rate(epoch)
+            # train for one epoch
+            train_losses, train_acc = self.train(logger, epoch)
+
+            # evaluate on validation set
+            val_losses, val_acc = self.validate(logger)
+
+            # log visualize
+            info_acc = {'train_acc': train_acc.avg, 'val_acc': val_acc.avg}
+            info_loss = {'train_loss': train_losses.avg, 'val_loss': val_losses.avg}
+            self.visualizer.write_summary(info_acc, info_loss, epoch + 1)
+
+            self.visualizer.write_histogram(model=self.model, step=epoch + 1)
+
+            # remember best Accuracy and save checkpoint
+            is_best = val_acc.avg > self.best_prec1
+            self.best_prec1 = max(val_acc.avg, self.best_prec1)
+            self.save_checkpoint({
+                'epoch': epoch + 1,
+                'state_dict': self.model.state_dict(),
+                'best_prec1': self.best_prec1,
+                'optimizer': self.optimizer.state_dict(),
+            }, is_best)
+
+            self.check_early_stop(val_acc.avg, logger, start_time)
+
+        end_time = time.time()
+        print("--- Total training time %s seconds ---" %
+              (end_time - start_time))
+        logger.info("--- Total training time %s seconds ---" %
+                    (end_time - start_time))
+        self.visualizer.writer_close()
+
+    # Training
+    def train(self, logger, epoch):
+        batch_time = AverageMeter()
+        data_time = AverageMeter()
+        losses = AverageMeter()
+        acc = AverageMeter()
+        top1 = AverageMeter()
+        top5 = AverageMeter()
+
+        # switch to train mode
+        self.model.train()
+
+        end = time.time()
+        for i, (images, target) in enumerate(self.train_loader):
+            # measure data loading time
+            data_time.update(time.time() - end)
+            if check_gpu() > 0:
+                images = images.cuda(async=True)
+                target = target.cuda(async=True)
+            image_var = torch.autograd.Variable(images)
+            label_var = torch.autograd.Variable(target)
+
+            self.optimizer.zero_grad()
+
+            # compute y_pred
+            y_pred = self.model(image_var)
+            loss = self.criterion(y_pred, label_var)
+            # measure accuracy and record loss
+            prec1, prec5 = accuracy(y_pred.data, target, topk=(1, 5))
+            losses.update(loss.item(), images.size(0))
+            acc.update(prec1.item(), images.size(0))
+            top1.update(prec1.item(), images.size(0))
+            top5.update(prec5.item(), images.size(0))
+            # compute gradient and do SGD step
+
+            loss.backward()
+            self.optimizer.step()
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % self.print_freq == 0:
+                print('Epoch: [{0}/{1}][{2}/{3}]\t'
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                      'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(epoch, self.epochs, i, len(self.train_loader),
+                                                                      batch_time=batch_time, data_time=data_time,
+                                                                      loss=losses, top1=top1, top5=top5))
+
+        logger.info('Epoch: [{0}/{1}]\t'
+                    'Loss {loss.avg:.4f}\t'
+                    'Acc {top1.avg:.3f}'.format(epoch, self.epochs, loss=losses, top1=top1))
+        return losses, acc
+
+    # Validation
+    def validate(self, logger):
+        batch_time = AverageMeter()
+        losses = AverageMeter()
+        acc = AverageMeter()
+        top1 = AverageMeter()
+        top5 = AverageMeter()
+        # switch to evaluate mode
+        self.model.eval()
+
+        end = time.time()
+        for i, (images, labels) in enumerate(self.val_loader):
+            if check_gpu() > 0:
+                images = images.cuda(async=True)
+                labels = labels.cuda(async=True)
+
+            image_var = torch.autograd.Variable(images)
+            label_var = torch.autograd.Variable(labels)
+
+            # compute y_pred
+            y_pred = self.model(image_var)
+            loss = self.criterion(y_pred, label_var)
+
+            # measure accuracy and record loss
+            prec1, prec5 = accuracy(y_pred.data, labels, topk=(1, 5))
+            losses.update(loss.item(), images.size(0))
+            acc.update(prec1.item(), images.size(0))
+            top1.update(prec1.item(), images.size(0))
+            top5.update(prec5.item(), images.size(0))
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % self.print_freq == 0:
+                print('TrainVal: [{0}/{1}]\t'
+                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                      'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                      'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
+                    i, len(self.val_loader), batch_time=batch_time, loss=losses, top1=top1, top5=top5))
+
+        print(
+            ' * Accuracy {acc.avg:.3f}  Loss {loss.avg:.3f}'.format(acc=acc, loss=losses))
+        logger.info(
+            ' * Accuracy {acc.avg:.3f}  Loss {loss.avg:.3f}'.format(acc=acc, loss=losses))
+
+        return losses, acc
+
+    # save checkpoint to file
+    def save_checkpoint(self, state, is_best):
+        checkpoint = os.path.join(self.data_folder, 'checkpoint.pth.tar')
+        torch.save(state, checkpoint)
+        model_best = os.path.join(self.data_folder, 'model_best.pth.tar')
+        if is_best:
+            shutil.copyfile(checkpoint, model_best)
+
+    # adjust learning rate for each epoch
+    def adjust_learning_rate(self, epoch):
+        """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
+        lr = self.lr * (0.1 ** (epoch // 30))
+        for param_group in self.optimizer.state_dict()['param_groups']:
+            param_group['lr'] = lr
