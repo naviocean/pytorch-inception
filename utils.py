@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 
-
 # get accuracy from y pred
 def accuracy(y_pred, y_actual, topk=(1,)):
     """Computes the precision@k for the specified values of k"""
@@ -25,3 +24,10 @@ def check_gpu():
     if torch.cuda.is_available():
         num_gpus = torch.cuda.device_count()
     return num_gpus
+
+def get_learning_rate(optimizer):
+    lr = []
+    for param_group in optimizer.param_groups:
+        lr += [param_group['lr']]
+    return lr
+

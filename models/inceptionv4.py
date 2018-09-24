@@ -293,7 +293,7 @@ class InceptionV4(nn.Module):
             Inception_C(),
             Inception_C()
         )
-        self.avg_pool = nn.AvgPool2d(5, count_include_pad=False)
+        self.avg_pool = nn.AvgPool2d(8, count_include_pad=False)
         self.last_linear = nn.Linear(1536, num_classes)
 
     def logits(self, features):
@@ -310,9 +310,10 @@ class InceptionV4(nn.Module):
 
 def inceptionv4(num_classes=1000, pretrained='imagenet'):
     if pretrained:
+        print('pretrained')
         settings = pretrained_settings['inceptionv4'][pretrained]
-        # assert num_classes == settings['num_classes'], \
-        #     "num_classes should be {}, but is {}".format(settings['num_classes'], num_classes)
+        assert num_classes == settings['num_classes'], \
+            "num_classes should be {}, but is {}".format(settings['num_classes'], num_classes)
 
         # both 'imagenet'&'imagenet+background' are loaded from same parameters
         model = InceptionV4(num_classes=1001)
@@ -343,12 +344,35 @@ python -m pretrainedmodels.inceptionv4
 ```
 '''
 if __name__ == '__main__':
-    assert inceptionv4(num_classes=10, pretrained=None)
-    print('success')
-    assert inceptionv4(num_classes=1000, pretrained='imagenet')
-    print('success')
-    assert inceptionv4(num_classes=1001, pretrained='imagenet+background')
-    print('success')
+    model_conv = inceptionv4(num_classes=1000, pretrained='imagenet')
+    ## Lets freeze the first few layers. This is done in two stages
+    # Stage-1 Freezing all the layers
+    for i, param in model_conv.named_parameters():
+        param.requires_grad = False
 
-    # fail
-    assert inceptionv4(num_classes=1001, pretrained='imagenet')
+    # Since imagenet as 1000 classes , We need to change our last layer according to the number of classes we have,
+    num_ftrs = model_conv.last_linear.in_features
+    model_conv.last_linear = nn.Linear(num_ftrs, 5)
+
+    # Stage-2 , Freeze all the layers till "Conv2d_4a_3*3"
+    ct = []
+    for name, child in model_conv.features.named_children():
+        if "4" in ct:
+            for params in child.parameters():
+                params.requires_grad = True
+        ct.append(name)
+    # To view which layers are freeze and which layers are not freezed:
+    for name, child in model_conv.features.named_children():
+
+        for name, params in child.named_parameters():
+            print(name, params.requires_grad)
+    #
+    # assert inceptionv4(num_classes=10, pretrained=None)
+    # print('success')
+    # assert inceptionv4(num_classes=1000, pretrained='imagenet')
+    # print('success')
+    # assert inceptionv4(num_classes=1001, pretrained='imagenet+background')
+    # print('success')
+    #
+    # # fail
+    # assert inceptionv4(num_classes=1001, pretrained='imagenet')

@@ -14,13 +14,13 @@ from models.inceptionv4 import inceptionv4
 from utils import check_gpu, accuracy
 from visualize import Visualizer
 from torchvision.transforms import *
+# os.environ['CUDA_VISIBLE_DEVICES'] = "0, 1"
 
 class Testing(object):
     def __init__(self, name_list, num_classes=400, **kwargs):
         self.__dict__.update(kwargs)
 
         self.num_classes = num_classes
-        self.modality = modality
         self.name_list = name_list
 
         # Set best precision = 0
@@ -48,10 +48,30 @@ class Testing(object):
     def loading_model(self):
 
         print('Loading %s model' % (self.model_type))
-        print('Loading %s model' % (self.model_type))
+        pretrained = None
+        if self.pretrained:
+            pretrained = 'imagenet'
 
         if self.model_type == 'inceptionv4':
-            self.model = inceptionv4(num_classes=self.num_classes, pretrained=None)
+            self.model = inceptionv4(num_classes=1000, pretrained=pretrained)
+            if self.pretrained:
+                num_ftrs = self.model.last_linear.in_features
+                self.model.last_linear = nn.Linear(num_ftrs, self.num_classes)
+                # free all layers:
+                for i, param in self.model.named_parameters():
+                    param.requires_grad = False
+                # unfreeze last layers:
+                ct = []
+                for name, child in self.model.features.named_children():
+                    if "4" in ct:
+                        for param in child.parameters():
+                            param.requires_grad = True
+                    ct.append(name)
+
+
+            else:
+                num_ftrs = self.model.last_linear.in_features
+                self.model.last_linear = nn.Linear(num_ftrs, self.num_classes)
         else:
             print('no model')
             exit()
@@ -60,16 +80,15 @@ class Testing(object):
         # Check gpu and run parallel
         if check_gpu() > 0:
             self.model = torch.nn.DataParallel(self.model).cuda()
+            # self.model.cuda()
 
         # define loss function (criterion) and optimizer
         self.criterion = nn.CrossEntropyLoss()
         if check_gpu() > 0:
             self.criterion = nn.CrossEntropyLoss().cuda()
 
-        policies = self.model.parameters()
-
-        self.optimizer = optim.SGD(policies, lr=self.lr, momentum=self.momentum, weight_decay=self.weight_decay)
-
+        params = list(filter(lambda p: p.requires_grad, self.model.parameters()))
+        self.optimizer = optim.SGD(params=params, lr=self.lr, momentum=self.momentum, weight_decay=self.weight_decay)
 
         file = os.path.join(self.data_folder, 'model_best.pth.tar')
         if os.path.isfile(file):
@@ -80,7 +99,7 @@ class Testing(object):
             self.best_prec1 = checkpoint['best_prec1']
             self.model.load_state_dict(checkpoint['state_dict'])
             self.optimizer.load_state_dict(checkpoint['optimizer'])
-            print("=> loaded model best ")
+            print("=> loaded best model")
         else:
             print("=> no model best found at ")
             exit()
@@ -89,15 +108,27 @@ class Testing(object):
 
     # Loading data
     def loading_data(self):
-        normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        # normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        normalize = Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        if self.tencrop:
+            val_transformations = Compose([
+                Resize(341),
+                TenCrop(299),
+                Lambda(lambda crops: torch.stack([ToTensor()(crop) for crop in crops])),
+                Lambda(
+                    lambda normal: torch.stack([normalize(nor) for nor in normal]))
 
-        val_transformations = Compose([
-            Resize(256),
-            CenterCrop(224),
-            RandomHorizontalFlip(),
-            ToTensor(),
-            normalize
-        ])
+            ])
+        else:
+            val_transformations = Compose([
+                Resize(341),
+                CenterCrop(299),
+                ToTensor(),
+                normalize
+            ])
+
+
+
 
         test_dataset = MyDataset(
             self.data,
@@ -109,7 +140,7 @@ class Testing(object):
 
         test_loader = data.DataLoader(
             test_dataset,
-            batch_size=1,
+            batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.workers,
             pin_memory=False)
@@ -129,20 +160,36 @@ class Testing(object):
 
         start_time = time.clock()
         print("Begin testing")
+        predicted, probs = [], []
         for i, (images, labels) in enumerate(self.test_loader):
+
             if check_gpu() > 0:
                 images = images.cuda(async=True)
                 labels = labels.cuda(async=True)
+            images = torch.autograd.Variable(images)
+            labels = torch.autograd.Variable(labels)
 
-            image_var = torch.autograd.Variable(images)
-            label_var = torch.autograd.Variable(labels)
+            if self.tencrop:
+                # Due to ten-cropping, input batch is a 5D Tensor
+                batch_size, number_of_crops, number_of_channels, height, width = images.size()
 
-            # compute y_pred
-            y_pred = self.model(image_var)
-            loss = self.criterion(y_pred, label_var)
+                # Fuse batch size and crops
+                images = images.view(-1, number_of_channels, height, width)
+
+                # Compute model output
+                output_batch_crops = self.model(images)
+
+                # Average predictions for each set of crops
+                output_batch = output_batch_crops.view(batch_size, number_of_crops, -1).mean(1)
+                label_repeated = labels.repeat(10, 1).transpose(1, 0).contiguous().view(-1, 1).squeeze()
+                loss = self.criterion(output_batch_crops, label_repeated)
+            else:
+                output_batch = self.model(images)
+                loss = self.criterion(output_batch, labels)
 
             # measure accuracy and record loss
-            prec1, prec5 = accuracy(y_pred.data, labels, topk=(1, 5))
+            prec1, prec5 = accuracy(output_batch.data, labels, topk=(1, 5))
+        #     print(prec1, prec5)
             losses.update(loss.item(), images.size(0))
             acc.update(prec1.item(), images.size(0))
             top1.update(prec1.item(), images.size(0))
